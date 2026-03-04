@@ -12,55 +12,55 @@ namespace FishRoguelike.Features.FishCatching
     ///
     /// Flow:
     ///   1. StartFishing() is called (e.g. when the player casts a line).
-    ///   2. A random arrow sequence is generated and shown on screen one-by-one.
-    ///   3. The player must press the matching arrow keys in order.
-    ///   4. OnFishCaught fires on success; OnFishEscaped fires on wrong input or timeout.
+    ///   2. A random arrow sequence is generated and shown on screen one by one.
+    ///   3. The player must press matching arrow keys in order.
+    ///      - Wrong press → mistake counted, icon flashes red, same arrow must be retried.
+    ///      - Too many mistakes → OnFishEscaped.
+    ///      - Time runs out → OnFishEscaped.
+    ///      - All arrows correct → OnFishCaught.
     ///
     /// Wire up in the Inspector:
-    ///   - sequenceDisplay  → ArrowSequenceDisplay on your UI canvas
-    ///   - inputHandler     → FishingInputHandler on any active GameObject
+    ///   - config          → FishCatchConfig ScriptableObject
+    ///   - sequenceDisplay → ArrowSequenceDisplay on your UI canvas
+    ///   - inputHandler    → FishingInputHandler on any active GameObject
     /// </summary>
     public class FishCatchingController : MonoBehaviour
     {
-        // ── Inspector ────────────────────────────────────────────────────────────
+        // ── Inspector ─────────────────────────────────────────────────────────────
 
-        [Header("Sequence Settings")]
-        [Tooltip("How many arrows are in the sequence.")]
-        [SerializeField, Range(1, 10)] private int sequenceLength = 4;
+        [SerializeField] private FishCatchConfig       config;
+        [SerializeField] private ArrowSequenceDisplay  sequenceDisplay;
+        [SerializeField] private FishingInputHandler   inputHandler;
 
-        [Tooltip("Time in seconds the player has to complete the full sequence.")]
-        [SerializeField] private float inputTimeLimit = 5f;
+        // ── Events ────────────────────────────────────────────────────────────────
 
-        [Tooltip("Delay between each arrow appearing during the show phase.")]
-        [SerializeField] private float delayPerArrow = 0.4f;
-
-        [Header("References")]
-        [SerializeField] private ArrowSequenceDisplay sequenceDisplay;
-        [SerializeField] private FishingInputHandler  inputHandler;
-
-        // ── Events ───────────────────────────────────────────────────────────────
-
-        /// <summary>Raised when the player successfully completes the sequence.</summary>
+        /// <summary>All arrows matched correctly.</summary>
         public event Action OnFishCaught;
 
-        /// <summary>Raised when the player inputs a wrong arrow or runs out of time.</summary>
+        /// <summary>Player ran out of mistakes or time.</summary>
         public event Action OnFishEscaped;
 
-        // ── State ────────────────────────────────────────────────────────────────
+        /// <summary>
+        /// Fired on every wrong key press.
+        /// int = mistakes used so far, int = max allowed mistakes.
+        /// </summary>
+        public event Action<int, int> OnMistake;
+
+        // ── State ─────────────────────────────────────────────────────────────────
 
         private List<ArrowDirection> _sequence;
         private int  _currentIndex;
+        private int  _mistakeCount;
         private bool _isActive;
         private bool _roundFinished;
         private bool _roundSucceeded;
 
         private CancellationTokenSource _cts;
 
-        // ── Public API ───────────────────────────────────────────────────────────
+        // ── Public API ────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Starts a fishing attempt. Safe to await from any MonoBehaviour.
-        /// Subsequent calls are ignored while a round is already active.
+        /// Starts a fishing attempt. Ignored if a round is already active.
         /// </summary>
         public async UniTask StartFishing()
         {
@@ -75,7 +75,6 @@ namespace FishRoguelike.Features.FishCatching
             }
             catch (OperationCanceledException)
             {
-                // Round was cancelled externally (e.g. player moved away).
                 sequenceDisplay.ClearIcons();
                 sequenceDisplay.Hide();
             }
@@ -87,43 +86,37 @@ namespace FishRoguelike.Features.FishCatching
             }
         }
 
-        /// <summary>Cancels an active fishing round without raising any result event.</summary>
-        public void CancelFishing()
-        {
-            _cts?.Cancel();
-        }
+        /// <summary>Cancels an active round without raising any result event.</summary>
+        public void CancelFishing() => _cts?.Cancel();
 
         // ── Private logic ─────────────────────────────────────────────────────────
 
         private async UniTask RunRound(CancellationToken ct)
         {
-            // 1. Generate & display sequence
-            _sequence     = GenerateSequence(sequenceLength);
-            _currentIndex = 0;
+            _sequence      = GenerateSequence(config.sequenceLength);
+            _currentIndex  = 0;
+            _mistakeCount  = 0;
             _roundFinished  = false;
             _roundSucceeded = false;
 
             sequenceDisplay.Show();
-            await sequenceDisplay.ShowSequenceAnimated(_sequence, delayPerArrow, ct);
+            await sequenceDisplay.ShowSequenceAnimated(_sequence, config.delayPerArrow, ct);
 
-            // 2. Enable input
             inputHandler.OnArrowPressed += HandleArrowInput;
             inputHandler.SetActive(true);
 
-            // 3. Wait for success / failure / timeout
             bool success = await WaitForRoundResult(ct);
 
-            // 4. Cleanup
             inputHandler.OnArrowPressed -= HandleArrowInput;
             inputHandler.SetActive(false);
 
-            // Brief pause so the player sees the last arrow highlighted
-            await UniTask.Delay(TimeSpan.FromSeconds(0.5f), cancellationToken: ct);
+            await UniTask.Delay(
+                TimeSpan.FromSeconds(config.resultDisplayDuration),
+                cancellationToken: ct);
 
             sequenceDisplay.ClearIcons();
             sequenceDisplay.Hide();
 
-            // 5. Fire result
             if (success)
                 OnFishCaught?.Invoke();
             else
@@ -139,8 +132,8 @@ namespace FishRoguelike.Features.FishCatching
                 ct.ThrowIfCancellationRequested();
 
                 elapsed += Time.deltaTime;
-                if (elapsed >= inputTimeLimit)
-                    return false; // timeout → fish escapes
+                if (elapsed >= config.inputTimeLimit)
+                    return false;
 
                 await UniTask.Yield(ct);
             }
@@ -152,26 +145,48 @@ namespace FishRoguelike.Features.FishCatching
         {
             if (!_isActive || _roundFinished) return;
 
-            bool correct = direction == _sequence[_currentIndex];
-
-            if (correct)
+            if (direction == _sequence[_currentIndex])
             {
                 sequenceDisplay.SetArrowState(_currentIndex, ArrowIconState.Correct);
                 _currentIndex++;
 
                 if (_currentIndex >= _sequence.Count)
                 {
-                    // All arrows matched!
                     _roundSucceeded = true;
                     _roundFinished  = true;
                 }
             }
             else
             {
-                sequenceDisplay.SetArrowState(_currentIndex, ArrowIconState.Wrong);
-                _roundSucceeded = false;
-                _roundFinished  = true;
+                _mistakeCount++;
+                OnMistake?.Invoke(_mistakeCount, config.maxMistakes);
+
+                if (_mistakeCount > config.maxMistakes)
+                {
+                    // Too many mistakes — fail immediately.
+                    sequenceDisplay.SetArrowState(_currentIndex, ArrowIconState.Wrong);
+                    _roundSucceeded = false;
+                    _roundFinished  = true;
+                }
+                else
+                {
+                    // Flash red, then let the player retry the same arrow.
+                    FlashWrongAndRetry(_currentIndex, _cts.Token).Forget();
+                }
             }
+        }
+
+        private async UniTaskVoid FlashWrongAndRetry(int index, CancellationToken ct)
+        {
+            sequenceDisplay.SetArrowState(index, ArrowIconState.Wrong);
+
+            await UniTask.Delay(
+                TimeSpan.FromSeconds(config.wrongFlashDuration),
+                cancellationToken: ct);
+
+            // Only reset if the round hasn't ended while we were waiting.
+            if (!_roundFinished)
+                sequenceDisplay.SetArrowState(index, ArrowIconState.Pending);
         }
 
         // ── Helpers ───────────────────────────────────────────────────────────────
