@@ -34,6 +34,7 @@ namespace FishRoguelike.Features.FishCatching
         [SerializeField] private FishCatchConfig      config;
         [SerializeField] private ArrowSequenceDisplay sequenceDisplay; // optional
         [SerializeField] private FishingInputHandler  inputHandler;
+        [SerializeField] private FishingTimerBar      timerBar;        // optional
 
         // ── Events ────────────────────────────────────────────────────────────────
 
@@ -90,6 +91,7 @@ namespace FishRoguelike.Features.FishCatching
             {
                 sequenceDisplay?.ClearIcons();
                 sequenceDisplay?.Hide();
+                timerBar?.Hide();
             }
             finally
             {
@@ -113,10 +115,18 @@ namespace FishRoguelike.Features.FishCatching
                 OnHookPhaseStarted?.Invoke(hookSeq);
 
                 sequenceDisplay?.Show();
+                timerBar?.Show();
+
+                // Bar fills while the hook sequence animates in.
+                float hookShowDuration = hookSeq.Count * config.hookDelayPerArrow;
+                timerBar?.AnimateFill(0f, 1f, hookShowDuration, ct).Forget();
 
                 if (sequenceDisplay != null)
                     await sequenceDisplay.ShowSequenceAnimated(hookSeq, config.hookDelayPerArrow, ct);
+                else if (hookShowDuration > 0f)
+                    await UniTask.Delay(TimeSpan.FromSeconds(hookShowDuration), cancellationToken: ct);
 
+                // Bar drains while the player inputs the hook sequence.
                 bool hooked = await RunInputPhase(
                     hookSeq,
                     config.hookMaxMistakes,
@@ -129,6 +139,7 @@ namespace FishRoguelike.Features.FishCatching
 
                 sequenceDisplay?.ClearIcons();
                 sequenceDisplay?.Hide();
+                timerBar?.Hide();
 
                 if (!hooked)
                 {
@@ -143,14 +154,17 @@ namespace FishRoguelike.Features.FishCatching
 
             sequenceDisplay?.Show();
             sequenceDisplay?.ShowSequenceInstant(sequence);
+            timerBar?.Show();
 
-            // ── Phase 3: Preview — input disabled while player memorises ──────────
+            // ── Phase 3: Preview — bar fills as player memorises ──────────────────
+            timerBar?.AnimateFill(0f, 1f, config.previewDuration, ct).Forget();
+
             if (config.previewDuration > 0f)
                 await UniTask.Delay(
                     TimeSpan.FromSeconds(config.previewDuration),
                     cancellationToken: ct);
 
-            // ── Phase 4: Catch ────────────────────────────────────────────────────
+            // ── Phase 4: Catch — bar drains with the input timer ──────────────────
             bool caught = await RunInputPhase(
                 sequence,
                 config.maxMistakes,
@@ -163,6 +177,7 @@ namespace FishRoguelike.Features.FishCatching
 
             sequenceDisplay?.ClearIcons();
             sequenceDisplay?.Hide();
+            timerBar?.Hide();
 
             if (caught)
                 OnFishCaught?.Invoke();
@@ -178,29 +193,39 @@ namespace FishRoguelike.Features.FishCatching
             float timeLimit,
             CancellationToken ct)
         {
-            _activeSequence    = sequence;
-            _activeIndex       = 0;
-            _activeMistakes    = 0;
+            _activeSequence     = sequence;
+            _activeIndex        = 0;
+            _activeMistakes     = 0;
             _activeMistakeLimit = maxMistakes;
-            _inputBlocked      = false;
-            _phaseFinished     = false;
-            _phaseSucceeded    = false;
+            _inputBlocked       = false;
+            _phaseFinished      = false;
+            _phaseSucceeded     = false;
 
             inputHandler.OnArrowPressed += HandleArrowInput;
             inputHandler.SetActive(true);
 
-            float elapsed = 0f;
-            while (!_phaseFinished)
-            {
-                ct.ThrowIfCancellationRequested();
-                elapsed += Time.deltaTime;
-                if (elapsed >= timeLimit)
-                    break; // timeout; _phaseSucceeded stays false
-                await UniTask.Yield(ct);
-            }
+            // Bar drains from full to empty as the timer counts down.
+            using var barCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timerBar?.AnimateFill(1f, 0f, timeLimit, barCts.Token).Forget();
 
-            inputHandler.OnArrowPressed -= HandleArrowInput;
-            inputHandler.SetActive(false);
+            try
+            {
+                float elapsed = 0f;
+                while (!_phaseFinished)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    elapsed += Time.deltaTime;
+                    if (elapsed >= timeLimit)
+                        break; // timeout; _phaseSucceeded stays false
+                    await UniTask.Yield(ct);
+                }
+            }
+            finally
+            {
+                barCts.Cancel(); // stop bar animation regardless of how the phase ended
+                inputHandler.OnArrowPressed -= HandleArrowInput;
+                inputHandler.SetActive(false);
+            }
 
             return _phaseSucceeded;
         }
